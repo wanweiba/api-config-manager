@@ -139,6 +139,80 @@
     font-size: 14px;
 }
 
+/* 区块标题行（标题 + 导入/导出按钮） */
+.api-config-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.api-config-section-header h4 {
+    margin: 0;
+}
+
+.api-config-section-actions {
+    display: flex;
+    gap: 5px;
+}
+
+.api-config-section-actions .menu_button {
+    padding: 4px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+/* 导入重名处理对话框 */
+.api-config-import-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 20000;
+}
+
+.api-config-import-dialog {
+    background: var(--SmartThemeBlurTintColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 20px;
+    max-width: 400px;
+    width: 90%;
+    color: var(--SmartThemeBodyColor);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(10px);
+}
+
+.api-config-import-dialog h4 {
+    margin: 0 0 10px 0;
+    color: var(--SmartThemeEmColor);
+    font-size: 14px;
+}
+
+.api-config-import-dialog p {
+    margin: 0 0 15px 0;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.api-config-import-dialog-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+}
+
+.api-config-import-dialog-actions .menu_button {
+    padding: 6px 12px;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
 .api-config-group-header {
     display: flex;
     align-items: center;

@@ -25,3 +25,6 @@ node_modules/
 # 忽略构建输出
 dist/
 build/
+
+# 忽略导出的配置文件（含明文密钥）
+api-configs-*.json

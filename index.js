@@ -43,9 +43,9 @@ const SOURCE_SECRET_KEYS = {
 // 扩展信息
 const EXTENSION_INFO = {
     name: 'API配置管理器',
-    version: '1.3.1',
+    version: '1.4.0',
     author: 'Lorenzzz-Elio',
-    repository: 'https://github.com/Lorenzzz-Elio/api-config-manager'
+    repository: 'https://github.com/wanweiba/api-config-manager'
 };
 
 // 默认设置
@@ -722,6 +722,162 @@ function deleteConfig(index) {
     }
 }
 
+// 导出配置
+function exportConfigs() {
+    const configs = extension_settings[MODULE_NAME].configs || [];
+
+    if (configs.length === 0) {
+        toastr.info('暂无配置可导出', 'API配置管理器');
+        return;
+    }
+
+    if (!confirm('导出文件包含明文 API 密钥，请妥善保管。确定要导出吗？')) {
+        return;
+    }
+
+    // 深拷贝并移除本机secrets系统的本地ID（跨设备无效）
+    const sanitizedConfigs = configs.map(config => {
+        const copy = JSON.parse(JSON.stringify(config));
+        delete copy.secretId;
+        delete copy.secretIds;
+        return copy;
+    });
+
+    const payload = {
+        version: '1',
+        exportedAt: new Date().toISOString(),
+        configs: sanitizedConfigs,
+    };
+
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const filename = `api-configs-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    toastr.success(`已导出 ${sanitizedConfigs.length} 条配置`, 'API配置管理器');
+}
+
+// 重名配置批量处理策略三选对话框
+// 返回 Promise<'overwrite'|'skip'|'each'>
+function askDuplicateStrategy(duplicateCount) {
+    return new Promise(resolve => {
+        const overlay = $(`
+            <div class="api-config-import-overlay">
+                <div class="api-config-import-dialog">
+                    <h4>发现 ${duplicateCount} 条重名配置</h4>
+                    <p>导入的配置中有 ${duplicateCount} 条与现有配置同名，请选择处理方式：</p>
+                    <div class="api-config-import-dialog-actions">
+                        <button class="menu_button" data-strategy="overwrite">全部覆盖</button>
+                        <button class="menu_button" data-strategy="skip">全部跳过</button>
+                        <button class="menu_button" data-strategy="each">逐个确认</button>
+                    </div>
+                </div>
+            </div>
+        `);
+
+        overlay.on('click', 'button[data-strategy]', function() {
+            const strategy = $(this).data('strategy');
+            overlay.remove();
+            resolve(strategy);
+        });
+
+        $('body').append(overlay);
+    });
+}
+
+// 从文件导入配置
+function importConfigsFromFile(file) {
+    const reader = new FileReader();
+
+    reader.onload = async () => {
+        let data;
+        try {
+            data = JSON.parse(String(reader.result));
+        } catch (error) {
+            console.error('解析导入文件失败:', error);
+            toastr.error('导入失败：文件不是有效的 JSON', 'API配置管理器');
+            return;
+        }
+
+        if (!data || typeof data !== 'object' || !Array.isArray(data.configs) || data.configs.length === 0) {
+            toastr.error('导入文件格式不正确：必须包含非空的 configs 数组', 'API配置管理器');
+            return;
+        }
+
+        const hasInvalid = data.configs.some(c => !c || typeof c !== 'object' || typeof c.name !== 'string' || !c.name.trim());
+        if (hasInvalid) {
+            toastr.error('导入文件格式不正确：每个配置必须包含字符串类型的 name 字段', 'API配置管理器');
+            return;
+        }
+
+        // 深拷贝并丢弃本机secrets系统的本地ID（跨设备无效）
+        const importedConfigs = data.configs.map(rawConfig => {
+            const config = JSON.parse(JSON.stringify(rawConfig));
+            delete config.secretId;
+            delete config.secretIds;
+            return config;
+        });
+
+        const configs = extension_settings[MODULE_NAME].configs;
+
+        // 先完整扫描一遍，统计与现有配置重名的条目
+        const duplicateCount = importedConfigs.filter(c => configs.some(existing => existing.name === c.name)).length;
+
+        let strategy = 'each';
+        if (duplicateCount > 0) {
+            strategy = await askDuplicateStrategy(duplicateCount);
+        }
+
+        let added = 0;
+        let overwritten = 0;
+        let skipped = 0;
+
+        for (const config of importedConfigs) {
+            const existingIndex = configs.findIndex(c => c.name === config.name);
+            if (existingIndex >= 0) {
+                let shouldOverwrite;
+                if (strategy === 'overwrite') {
+                    shouldOverwrite = true;
+                } else if (strategy === 'skip') {
+                    shouldOverwrite = false;
+                } else {
+                    shouldOverwrite = confirm(`已存在同名配置 "${config.name}"，是否覆盖？\n确定 = 覆盖，取消 = 跳过`);
+                }
+
+                if (shouldOverwrite) {
+                    configs[existingIndex] = config;
+                    overwritten++;
+                } else {
+                    skipped++;
+                }
+            } else {
+                configs.push(config);
+                added++;
+            }
+        }
+
+        saveSettingsDebounced();
+        renderConfigList();
+        toastr.success(`导入完成：新增 ${added} 条，覆盖 ${overwritten} 条，跳过 ${skipped} 条`, 'API配置管理器');
+    };
+
+    reader.onerror = () => {
+        toastr.error('读取文件失败', 'API配置管理器');
+    };
+
+    reader.readAsText(file);
+}
+
+
 // 渲染配置列表
 function renderConfigList() {
     const container = $('#api-config-list');
@@ -893,7 +1049,14 @@ async function createUI() {
                             <small id="api-config-source-hint">Custom：使用OpenAI兼容接口（可用于反代OpenAI兼容服务）。</small>
                         </div>
                         <div class="api-config-section">
-                            <h4>已保存的配置</h4>
+                            <div class="api-config-section-header">
+                                <h4>已保存的配置</h4>
+                                <div class="api-config-section-actions">
+                                    <button id="api-config-export" class="menu_button" title="导出所有配置为 JSON 文件">导出配置</button>
+                                    <button id="api-config-import" class="menu_button" title="从 JSON 文件导入配置">导入配置</button>
+                                </div>
+                            </div>
+                            <input type="file" id="api-config-import-file" accept=".json" style="display: none;">
                             <div id="api-config-list"></div>
                         </div>
                     </div>
@@ -1011,6 +1174,24 @@ function bindEvents() {
     $(document).on('click', '.api-config-delete', function() {
         const index = parseInt($(this).data('index'));
         deleteConfig(index);
+    });
+
+    // 导出配置
+    $(document).on('click', '#api-config-export', exportConfigs);
+
+    // 导入配置（触发隐藏的文件选择器）
+    $(document).on('click', '#api-config-import', function() {
+        $('#api-config-import-file').trigger('click');
+    });
+
+    // 处理导入文件选择
+    $(document).on('change', '#api-config-import-file', function() {
+        const file = this.files && this.files[0];
+        if (file) {
+            importConfigsFromFile(file);
+        }
+        // 重置以便可以重复选择同一文件
+        $(this).val('');
     });
 
     // 回车保存配置
