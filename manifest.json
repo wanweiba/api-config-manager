@@ -6,8 +6,8 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Lorenzzz-Elio",
-    "version": "1.4.0",
-    "changelog": "新增配置导出/导入功能，重名支持批量覆盖/跳过",
+    "version": "1.5.0",
+    "changelog": "新增分组轮询功能（失败自动切换、手动停止打断、防死循环）；新增配置复制功能；新增导入重名批量处理",
     "homePage": "https://github.com/wanweiba/api-config-manager",
     "description": "A SillyTavern extension for managing multiple API configurations with quick switching capabilities."
 }

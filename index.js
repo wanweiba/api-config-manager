@@ -1,5 +1,5 @@
 import { extension_settings, renderExtensionTemplateAsync } from '../../../../../scripts/extensions.js';
-import { eventSource, event_types, saveSettingsDebounced, getRequestHeaders } from '../../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, getRequestHeaders, Generate, chat } from '../../../../../script.js';
 import { SECRET_KEYS, writeSecret, findSecret, readSecretState, secret_state } from '../../../../../scripts/secrets.js';
 
 // Import rotateSecret if available (added in newer SillyTavern versions)
@@ -43,7 +43,7 @@ const SOURCE_SECRET_KEYS = {
 // 扩展信息
 const EXTENSION_INFO = {
     name: 'API配置管理器',
-    version: '1.4.0',
+    version: '1.5.0',
     author: 'Lorenzzz-Elio',
     repository: 'https://github.com/wanweiba/api-config-manager'
 };
@@ -51,7 +51,8 @@ const EXTENSION_INFO = {
 // 默认设置
 const defaultSettings = {
     configs: [], // 存储配置列表: [{name: string, url: string, key: string, model?: string}]
-    collapsedGroups: {} // 存储折叠状态: {groupName: boolean}
+    collapsedGroups: {}, // 存储折叠状态: {groupName: boolean}
+    rotation: { enabled: false, group: '', fallbackToPrevious: true } // 分组轮询状态
 };
 
 // 编辑状态
@@ -194,6 +195,11 @@ function initSettings() {
         extension_settings[MODULE_NAME].collapsedGroups = {};
     }
 
+    // 确保rotation对象存在
+    if (!extension_settings[MODULE_NAME].rotation || typeof extension_settings[MODULE_NAME].rotation !== 'object') {
+        extension_settings[MODULE_NAME].rotation = { enabled: false, group: '', fallbackToPrevious: true };
+    }
+
     // 兼容旧配置结构
     for (const config of extension_settings[MODULE_NAME].configs) {
         if (!config || typeof config !== 'object') continue;
@@ -226,7 +232,9 @@ async function getCurrentApiConfig() {
 }
 
 // 应用配置到表单
-async function applyConfig(config) {
+// options.quiet: 静默模式，不发成功提示、不操作模型下拉框（轮询切换用）
+// options.autoConnect: 应用后是否触发一次连接测试（轮询切换时跳过，设置直接作用于下一次生成）
+async function applyConfig(config, { quiet = false, autoConnect = true } = {}) {
     try {
         if (!$('#api_button_openai').length || !$('#chat_completion_source').length) {
             throw new Error('未找到API连接界面元素，请在OpenAI/Chat Completions设置页使用此扩展');
@@ -257,19 +265,33 @@ async function applyConfig(config) {
         // 保存设置
         saveSettingsDebounced();
 
-        // 显示应用成功消息
-        toastr.success(`正在连接到: ${config.name}（${getSourceLabel(source)}）`, 'API配置管理器');
+        if (!quiet) {
+            // 显示应用成功消息
+            toastr.success(`正在连接到: ${config.name}（${getSourceLabel(source)}）`, 'API配置管理器');
+        }
 
         // 如果有指定模型，先尝试设置（连接完成后会再次尝试自动选中）
         if (config.model) {
-            setPreferredModel(config.model, config.name, source);
+            if (quiet) {
+                // 静默模式只写入设置（Generate 直接读取 oai_settings），不动下拉框、不发提示
+                if (typeof oai_settings !== 'undefined') {
+                    const settingKey = SOURCE_MODEL_SETTING_KEYS[source];
+                    if (settingKey) {
+                        oai_settings[settingKey] = config.model;
+                    }
+                }
+            } else {
+                setPreferredModel(config.model, config.name, source);
+            }
         }
 
         // 自动重新连接
-        $('#api_button_openai').trigger('click');
+        if (autoConnect) {
+            $('#api_button_openai').trigger('click');
+        }
 
         // 监听连接状态变化，连接成功后立即设置模型
-        if (config.model) {
+        if (!quiet && config.model) {
             waitForConnectionAndSetModel(config.model, config.name, source);
         }
 
@@ -877,11 +899,288 @@ function importConfigsFromFile(file) {
     reader.readAsText(file);
 }
 
+// ===== 分组轮询 =====
+// 失败判定基于事件 + 聊天记录对比（SillyTavern 没有 GENERATION_FAILED 事件）：
+// - normal：成功时新增一条角色消息；失败时最后一条仍是用户/系统消息
+// - regenerate：成功时先删除旧角色消息再推新消息（chat.length 不变、最后一条是新角色消息）；
+//   失败时旧消息已被删且无新消息（chat.length -1、最后一条是用户消息）
+//   —— 两者统一用「chat.length 变少 或 最后一条不是角色消息」判定失败
+// - swipe：成功时最后一条消息的 swipes 数 +1；失败时不变
+// - continue：成功时最后一条消息内容变长；失败时不变
+// 流式中途失败时已产生的部分内容视为已交付，不触发切换。
+
+const ROTATION_RETRY_DELAY_MS = 500;
+const ROTATION_WATCH_TYPES = ['normal', 'continue', 'swipe', 'regenerate'];
+
+let lastAppliedIndex = -1;              // 最近一次通过本扩展应用的配置下标（轮询基线用）
+let rotationBaselineName = null;        // 开启轮询时的基线配置名
+let rotationCurrentName = null;         // 轮询当前生效的配置名
+let rotationFailedNames = new Set();    // 本轮已失败的配置名
+let rotationInFlight = false;           // 是否有受监控的生成正在进行
+let rotationRoundId = 0;                // 每条用户消息 +1，用于作废旧轮次的重试定时器
+let rotationRetryTimer = null;
+let rotationWatchType = 'normal';
+let rotationChatLengthBefore = 0;
+let rotationLastMsgLenBefore = 0;
+let rotationLastSwipeCountBefore = 0;
+
+// 获取指定分组的配置（附带其在 configs 中的下标）
+function getGroupConfigs(groupName) {
+    return extension_settings[MODULE_NAME].configs
+        .map((config, index) => ({ config, index }))
+        .filter(({ config }) => (config.group || '未分组') === groupName);
+}
+
+// 刷新轮询分组下拉框（分组可能随配置增删改而变化）
+function populateRotationGroups() {
+    const select = $('#api-config-rotation-group');
+    if (!select.length) return;
+
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    const groups = [...new Set(extension_settings[MODULE_NAME].configs.map(c => c.group || '未分组'))].sort();
+
+    select.empty();
+    groups.forEach(groupName => {
+        select.append($('<option>').val(groupName).text(groupName));
+    });
+
+    if (groups.includes(rotation.group)) {
+        select.val(rotation.group);
+    }
+}
+
+// 更新轮询相关 UI（开关按钮文本、状态行、分组下拉框可用性）
+function updateRotationUI() {
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    const toggle = $('#api-config-rotation-toggle');
+    const status = $('#api-config-rotation-status');
+    const groupSelect = $('#api-config-rotation-group');
+    if (!toggle.length) return;
+
+    if (rotation.enabled) {
+        const total = getGroupConfigs(rotation.group).length;
+        toggle.text('停止轮询');
+        groupSelect.prop('disabled', true);
+        status.text(`轮询中：分组「${rotation.group}」· 当前：${rotationCurrentName || '未知'} · 本轮已失败 ${rotationFailedNames.size}/${total}`);
+    } else {
+        toggle.text('开启轮询');
+        groupSelect.prop('disabled', false);
+        status.text('轮询未开启');
+    }
+
+    $('#api-config-rotation-fallback').prop('checked', !!rotation.fallbackToPrevious);
+}
+
+// 停止轮询（可选提示）
+function stopRotation(message) {
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    rotation.enabled = false;
+
+    clearTimeout(rotationRetryTimer);
+    rotationRetryTimer = null;
+    rotationInFlight = false;
+    rotationFailedNames = new Set();
+
+    saveSettingsDebounced();
+    updateRotationUI();
+
+    if (message) {
+        toastr.info(message, 'API配置管理器');
+    }
+}
+
+// 开启/停止轮询
+async function toggleRotation() {
+    const settings = extension_settings[MODULE_NAME];
+    const rotation = settings.rotation;
+
+    if (rotation.enabled) {
+        stopRotation('已停止分组轮询');
+        return;
+    }
+
+    const group = $('#api-config-rotation-group').val();
+    if (!group) {
+        toastr.warning('请先选择要轮询的分组', 'API配置管理器');
+        return;
+    }
+
+    const groupConfigs = getGroupConfigs(group);
+    if (groupConfigs.length < 2) {
+        toastr.warning(`分组「${group}」内可用配置不足 2 个（当前 ${groupConfigs.length} 个），无法开启轮询`, 'API配置管理器');
+        return;
+    }
+
+    rotation.enabled = true;
+    rotation.group = group;
+    rotation.fallbackToPrevious = $('#api-config-rotation-fallback').is(':checked');
+
+    // 基线：开启轮询前最后一次通过本扩展应用的配置（密钥无法回读，故只记名字）
+    const baselineConfig = lastAppliedIndex >= 0 ? settings.configs[lastAppliedIndex] : null;
+    rotationBaselineName = baselineConfig ? baselineConfig.name : null;
+
+    rotationFailedNames = new Set();
+    rotationCurrentName = groupConfigs[0].config.name;
+
+    saveSettingsDebounced();
+    await applyConfig(groupConfigs[0].config, { quiet: true, autoConnect: false });
+    toastr.success(`已开启分组轮询：「${group}」（共 ${groupConfigs.length} 个配置），当前使用 ${rotationCurrentName}`, 'API配置管理器');
+    updateRotationUI();
+}
+
+// 组内全部失败：停止轮询，按设置尝试切回基线配置
+async function handleRotationAllFailed() {
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    const group = rotation.group;
+    const fallback = rotation.fallbackToPrevious;
+    const baselineName = rotationBaselineName;
+
+    stopRotation();
+
+    if (fallback && baselineName) {
+        const baseline = extension_settings[MODULE_NAME].configs.find(c => c.name === baselineName);
+        if (baseline) {
+            await applyConfig(baseline, { quiet: true, autoConnect: false });
+            toastr.warning(`分组「${group}」内配置全部失败，已停止轮询并切回「${baseline.name}」`, 'API配置管理器');
+            return;
+        }
+    }
+
+    toastr.error(`分组「${group}」内配置全部失败，已停止轮询，请手动切回配置`, 'API配置管理器');
+}
+
+// 切换到组内下一个未失败的配置并重试生成
+async function rotationRetry(genType, round) {
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    if (!rotation.enabled) return;
+
+    if (rotationCurrentName) {
+        rotationFailedNames.add(rotationCurrentName);
+    }
+
+    const groupConfigs = getGroupConfigs(rotation.group);
+    const next = groupConfigs.find(({ config }) => !rotationFailedNames.has(config.name));
+
+    if (!next) {
+        await handleRotationAllFailed();
+        return;
+    }
+
+    rotationCurrentName = next.config.name;
+    updateRotationUI();
+    toastr.info(`请求失败，切换到「${next.config.name}」并重试（已失败 ${rotationFailedNames.size}/${groupConfigs.length}）`, 'API配置管理器');
+
+    await applyConfig(next.config, { quiet: true, autoConnect: false });
+
+    // 切换配置是异步的（含密钥写入），期间用户可能已发送新消息或开始了新生成，避免并发生成
+    if (round !== rotationRoundId || rotationInFlight) return;
+
+    const retryType = ROTATION_WATCH_TYPES.includes(genType) ? genType : 'normal';
+    try {
+        await Generate(retryType);
+    } catch (error) {
+        // Generate 内部已提示错误并重新抛出，这里只需吞掉避免未处理的 rejection
+        console.warn('轮询重试生成结束（含失败）:', error);
+    }
+}
+
+// 生成开始：记录判定失败所需的快照
+function onRotationGenerationStarted(type, options, dryRun) {
+    console.log('[ACM] GENERATION_STARTED', { type, dryRun, automatic_trigger: options?.automatic_trigger });
+    if (dryRun || !ROTATION_WATCH_TYPES.includes(type)) return;
+
+    rotationInFlight = true;
+    rotationWatchType = type;
+
+    const lastMsg = chat[chat.length - 1];
+    rotationChatLengthBefore = chat.length;
+    rotationLastMsgLenBefore = lastMsg?.mes?.length ?? 0;
+    rotationLastSwipeCountBefore = Array.isArray(lastMsg?.swipes) ? lastMsg.swipes.length : 0;
+}
+
+// 生成结束：判定成功/失败，失败则调度延迟重试
+function onRotationGenerationEnded() {
+    console.log('[ACM] GENERATION_ENDED', { inFlight: rotationInFlight, enabled: extension_settings[MODULE_NAME].rotation?.enabled, watchType: rotationWatchType });
+    if (!rotationInFlight) return;
+    rotationInFlight = false;
+
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    if (!rotation.enabled) return;
+
+    const lastMsg = chat[chat.length - 1];
+    let failed;
+    if (rotationWatchType === 'normal' || rotationWatchType === 'regenerate') {
+        // normal 成功 = 新增角色消息；regenerate 成功 = 删旧角色消息后推新消息
+        // 两者失败时：最后一条仍是用户/系统消息（regenerate 失败还会少一条）
+        const lastIsAssistant = !!lastMsg && !lastMsg.is_user && !lastMsg.is_system;
+        failed = chat.length < rotationChatLengthBefore || !lastIsAssistant;
+    } else {
+        // swipe：swipes 数应增长；continue：消息内容应变长（两者满足其一即视为成功）
+        const grewSwipes = !!lastMsg && (Array.isArray(lastMsg.swipes) ? lastMsg.swipes.length : 0) > rotationLastSwipeCountBefore;
+        const grewMsg = !!lastMsg && (lastMsg.mes?.length ?? 0) > rotationLastMsgLenBefore;
+        failed = !grewSwipes && !grewMsg;
+    }
+    console.log('[ACM] 判定', { type: rotationWatchType, failed, chatLengthBefore: rotationChatLengthBefore, chatLength: chat.length, lastMsgIsUser: lastMsg?.is_user, lastMsgIsSystem: lastMsg?.is_system, msgLenBefore: rotationLastMsgLenBefore, msgLenAfter: lastMsg?.mes?.length, swipesBefore: rotationLastSwipeCountBefore, swipesAfter: lastMsg?.swipes?.length });
+
+    if (!failed) return;
+
+    // 延迟重试：期间可被 GENERATION_STOPPED 取消，或被新用户消息作废
+    const round = rotationRoundId;
+    clearTimeout(rotationRetryTimer);
+    rotationRetryTimer = setTimeout(() => {
+        rotationRetryTimer = null;
+        if (round !== rotationRoundId) return; // 用户已发送新消息，旧轮次作废
+        console.log('[ACM] 重试定时器触发', { round });
+        rotationRetry(rotationWatchType, round);
+    }, ROTATION_RETRY_DELAY_MS);
+    console.log('[ACM] 已调度重试', { round, delayMs: ROTATION_RETRY_DELAY_MS });
+}
+
+// 用户手动停止：立即取消待执行的自动重试
+function onRotationGenerationStopped() {
+    console.log('[ACM] GENERATION_STOPPED', { hadPendingRetry: !!rotationRetryTimer, inFlight: rotationInFlight });
+    clearTimeout(rotationRetryTimer);
+    rotationRetryTimer = null;
+    rotationInFlight = false;
+}
+
+// 新用户消息开启新一轮：清空失败记录，作废旧的重试定时器
+function onRotationMessageSent() {
+    rotationRoundId++;
+    rotationFailedNames = new Set();
+}
+
+// 订阅轮询相关事件
+function subscribeRotationEvents() {
+    eventSource.on(event_types.GENERATION_STARTED, onRotationGenerationStarted);
+    eventSource.on(event_types.GENERATION_ENDED, onRotationGenerationEnded);
+    eventSource.on(event_types.GENERATION_STOPPED, onRotationGenerationStopped);
+    eventSource.on(event_types.MESSAGE_SENT, onRotationMessageSent);
+    console.log('[ACM] 轮询事件已订阅');
+}
+
+// 页面加载时恢复轮询运行状态（尝试按当前 URL 识别生效中的配置）
+function initRotationState() {
+    const rotation = extension_settings[MODULE_NAME].rotation;
+    if (!rotation.enabled) return;
+
+    const currentUrl = typeof oai_settings !== 'undefined' ? (oai_settings.custom_url || '') : '';
+    if (currentUrl) {
+        const match = getGroupConfigs(rotation.group).find(({ config }) => (config.customUrl || config.url) === currentUrl);
+        rotationCurrentName = match ? match.config.name : null;
+    }
+}
+
 
 // 渲染配置列表
 function renderConfigList() {
     const container = $('#api-config-list');
     container.empty();
+
+    // 分组可能随配置增删改变化，同步刷新轮询分组下拉框
+    populateRotationGroups();
+    // 轮询队列为实时读取，状态行中的组内总数随增删即时刷新
+    updateRotationUI();
 
     const configs = extension_settings[MODULE_NAME].configs;
 
@@ -929,6 +1228,7 @@ function renderConfigList() {
                         <button class="menu_button api-config-apply" data-index="${index}">应用</button>
                         <button class="menu_button api-config-edit" data-index="${index}">编辑</button>
                         <button class="menu_button api-config-delete" data-index="${index}">删除</button>
+                        <button class="menu_button api-config-copy" data-index="${index}">复制</button>
                     </div>
                 </div>
             `);
@@ -999,6 +1299,43 @@ function cancelEditConfig() {
     toastr.info('已取消编辑，切换到新建配置模式', 'API配置管理器');
 }
 
+// 复制配置到表单（作为新配置，不进入编辑模式）
+function copyConfig(index) {
+    const config = extension_settings[MODULE_NAME].configs[index];
+    if (!config) return;
+
+    // 保持新建模式：退出可能存在的编辑状态，保存后追加为新配置而不是覆盖原配置
+    editingIndex = -1;
+    $('#api-config-save').text('保存配置');
+    $('#api-config-cancel').hide();
+
+    // 生成不重复的副本名称：xxx（副本）、xxx（副本2）……
+    const existingNames = new Set(extension_settings[MODULE_NAME].configs.map(c => c.name));
+    let copyName = `${config.name}（副本）`;
+    let serial = 2;
+    while (existingNames.has(copyName)) {
+        copyName = `${config.name}（副本${serial}）`;
+        serial++;
+    }
+
+    // 填入表单（不带 secretId/secretIds，保存时按新 key 重新写入 secrets）
+    $('#api-config-name').val(copyName);
+    $('#api-config-group').val(config.group || '');
+    $('#api-config-source').val(normalizeSource(config.source)).trigger('change');
+    $('#api-config-url').val((typeof config.customUrl === 'string' ? config.customUrl : config.url) || '');
+    $('#api-config-key').val(config.key || '');
+    $('#api-config-reverse-proxy').val(config.reverseProxy || '');
+    $('#api-config-proxy-password').val(config.proxyPassword || '');
+    $('#api-config-model').val(config.model || '');
+    $('#api-config-model-select').hide();
+
+    // 滚动到表单顶部并聚焦名称字段
+    $('#api-config-name')[0].scrollIntoView({ behavior: 'smooth' });
+    $('#api-config-name').focus();
+
+    toastr.info(`已复制配置：${config.name}，请修改后保存`, 'API配置管理器');
+}
+
 // 创建UI
 async function createUI() {
     try {
@@ -1058,6 +1395,18 @@ async function createUI() {
                             </div>
                             <input type="file" id="api-config-import-file" accept=".json" style="display: none;">
                             <div id="api-config-list"></div>
+                        </div>
+                        <div class="api-config-section">
+                            <h4>分组轮询</h4>
+                            <div class="flex-container flexGap5 api-config-rotation-controls">
+                                <select id="api-config-rotation-group" class="text_pole"></select>
+                                <button id="api-config-rotation-toggle" class="menu_button">开启轮询</button>
+                            </div>
+                            <label class="checkbox_label api-config-rotation-fallback">
+                                <input type="checkbox" id="api-config-rotation-fallback">
+                                <span>全部失败后切回原配置</span>
+                            </label>
+                            <small id="api-config-rotation-status">轮询未开启</small>
                         </div>
                     </div>
                 </div>
@@ -1161,6 +1510,12 @@ function bindEvents() {
     $(document).on('click', '.api-config-apply', async function() {
         const index = parseInt($(this).data('index'));
         const config = extension_settings[MODULE_NAME].configs[index];
+        // 记录为轮询基线，并同步轮询的"当前配置"
+        lastAppliedIndex = index;
+        if (config?.name) {
+            rotationCurrentName = config.name;
+        }
+        updateRotationUI();
         await applyConfig(config);
     });
 
@@ -1174,6 +1529,12 @@ function bindEvents() {
     $(document).on('click', '.api-config-delete', function() {
         const index = parseInt($(this).data('index'));
         deleteConfig(index);
+    });
+
+    // 复制配置
+    $(document).on('click', '.api-config-copy', function() {
+        const index = parseInt($(this).data('index'));
+        copyConfig(index);
     });
 
     // 导出配置
@@ -1194,6 +1555,21 @@ function bindEvents() {
         $(this).val('');
     });
 
+    // 开启/停止分组轮询
+    $(document).on('click', '#api-config-rotation-toggle', toggleRotation);
+
+    // 轮询分组选择
+    $(document).on('change', '#api-config-rotation-group', function() {
+        extension_settings[MODULE_NAME].rotation.group = $(this).val() || '';
+        saveSettingsDebounced();
+    });
+
+    // 轮询失败回退选项
+    $(document).on('change', '#api-config-rotation-fallback', function() {
+        extension_settings[MODULE_NAME].rotation.fallbackToPrevious = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+
     // 回车保存配置
     $(document).on('keypress', '#api-config-name, #api-config-url, #api-config-key, #api-config-reverse-proxy, #api-config-proxy-password, #api-config-model', function(e) {
         if (e.which === 13) {
@@ -1209,6 +1585,9 @@ async function initExtension() {
     bindEvents();
     updateFormBySource($('#api-config-source').val());
     renderConfigList(); // 初始化时渲染配置列表
+    initRotationState(); // 恢复轮询运行状态（如刷新前已开启）
+    updateRotationUI();
+    subscribeRotationEvents();
 
     // 延迟检查更新（避免影响扩展加载速度）
     setTimeout(() => {
